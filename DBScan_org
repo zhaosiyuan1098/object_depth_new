@@ -1,0 +1,207 @@
+# Copyright (C) USTC BMEC RFLab - All Rights Reserved.
+# Unauthorized copying of this file, via any medium is strictly prohibited.
+# Proprietary and confidential.
+
+from matplotlib.pyplot import axis
+import pyrealsense2 as rs
+import numpy as np
+from rsworker import *
+import cv2
+import open3d as o3d
+import utils as utils
+import matplotlib.pyplot as plt
+
+def frame_to_np_array(frame, cccize_depth=False):
+    # Create colorized depth frame
+    if colorize_depth:
+        colorizer = rs.colorizer()
+        frame_as_image = np.asanyarray(colorizer.colorize(frame).get_data())
+        return frame_as_image
+    else:
+        return np.asanyarray(frame.get_data())
+
+
+def readByRSW(bag_file, usePlayBack=True, showPlt=True):
+    rsw = RSWorker(
+        enable_RGB=True,
+        enable_infrared=False,
+        ros_bag=bag_file,
+    )
+    rsw.start()
+    playback = rsw.profile.get_device().as_playback()
+    depthFrameList = []
+    colorFrameList = []
+
+    # FIXME: how to acquire global depth_scale?
+    # depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
+    depth_scale = 0.001
+    try:
+        while True:
+            frames = rsw.get_data(aligned_to_color=True)
+            if usePlayBack:
+                playback.pause()
+
+            if not frames:
+                break
+            depth_frame = frames.get_depth_frame()
+
+            # FIXME: how to acquire global intrinsics?
+            intrinsics = frames.profile.as_video_stream_profile().intrinsics
+
+            depth_np = rsw.frame_to_np_array(depth_frame)
+
+            # NOTE: only first 32 frames could be sustained if copy=False
+            depthFrameList.append(np.array(depth_np, copy=True))
+
+            color_np = rsw.frame_to_np_array(frames.get_color_frame())
+            color_np = color_np[:, :, ::-1].copy()
+            colorFrameList.append(np.array(color_np, copy=True))
+
+            if showPlt:
+                depth_img = rsw.frame_to_np_array(depth_frame,
+                                                  colorize_depth=True)
+                images = np.hstack((depth_img, color_np))
+                cv2.namedWindow('Example', cv2.WINDOW_AUTOSIZE)
+                cv2.imshow('Example', images)
+                key = cv2.waitKey(1)
+
+            if usePlayBack:
+                playback.resume()
+        rsw.stop()
+    except RuntimeError:
+        print("There are no more frames left in the .bag file!")
+    return depthFrameList, colorFrameList, intrinsics, depth_scale
+
+
+def readWithoutRSW(bag_file, usePlayBack=True):
+    # A simple example for reading bag file
+    frameList = []
+    try:
+        config = rs.config()
+        config.enable_device_from_file(bag_file, repeat_playback=False)
+        pipeline = rs.pipeline()
+        profile = pipeline.start(config)
+        playback = profile.get_device().as_playback()
+        playback.set_real_time(False)
+
+        while True:
+            frames = pipeline.wait_for_frames()
+            if usePlayBack:
+                playback.pause()
+            depth_frame = frames.get_depth_frame()
+            if not depth_frame:
+                continue
+
+            frameList.append(
+                np.array(frame_to_np_array(depth_frame), copy=True))
+            depth_image = frame_to_np_array(depth_frame, colorize_depth=True)
+
+            cv2.namedWindow('Example', cv2.WINDOW_AUTOSIZE)
+            cv2.imshow('Example', depth_image)
+            key = cv2.waitKey(1)
+
+            if usePlayBack:
+                playback.resume()
+
+    except RuntimeError:
+        print("There are no more frames left in the .bag file!")
+    return frameList
+
+
+
+def getPcds(folder):
+    depthFrameList, colorFrameList, intrinsics, depth_scale = readByRSW(
+        bag_file='data/20221222/DS325.bag', usePlayBack=False, showPlt=False)
+    print('frameList', np.shape(np.asarray(depthFrameList)))
+
+    pinhole_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+        intrinsics.width, intrinsics.height, intrinsics.fx, intrinsics.fy,
+        intrinsics.ppx, intrinsics.ppy)
+    count=0
+    for depthF, colorF in zip(depthFrameList, colorFrameList):
+        pcdC = utils.rgbdToPcd(depthF,
+                            colorF[:, :, ::-1].copy(),
+                            pinhole_camera_intrinsic,
+                            depth_scale)
+        
+        loc = o3d.geometry.TriangleMesh.create_coordinate_frame(size=50)
+        o3d.visualization.draw_geometries([pcdC, loc])
+
+        distance = np.linalg.norm(np.asarray(pcdC.points), axis=1)
+
+        # resever points inside 360mm from camera
+        pcdC = pcdC.select_by_index(np.where(distance < 500)[0])
+
+        pcdC, ind = pcdC.remove_statistical_outlier(nb_neighbors=20, std_ratio=20)
+        numface=count
+        DbScanClustering(pcdC,numface,eps=5,min_points=10,folder=folder)
+        #o3d.io.write_point_cloud('./temp/obj_pcds_' + str(count) + '.pcd', pcdC )
+        # o3d.visualization.draw_geometries([pcdC])
+        count = count + 1
+
+
+def DbScanClustering(pcd, numface, eps, min_points, folder):
+    # path = './temp/obj_pcds_0.pcd'
+    # print(path)
+
+    # pcd = o3d.io.read_point_cloud("data/20221221/scene_all.pcd")
+    print(pcd)
+
+    # 定义以选中的点开始蔓延，邻居点距离eps的，最小有min_points个点，可以构成一个簇；适用于点云分隔的比较开的，一块一块的点云。
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
+        labels = np.array(pcd.cluster_dbscan(eps, min_points, print_progress=True))
+
+    max_label = labels.max()
+    print(f"point cloud has {max_label + 1} clusters")
+    colors = plt.get_cmap("tab20")(labels / (max_label if max_label > 0 else 1))
+
+    colors[labels < 0] = 0
+    #pcd.colors = o3d.utility.Vector3dVector(colors[:, :3])
+
+    o3d.visualization.draw_geometries([pcd], "o3d dbscanclusting origin", width=400, height=400)
+
+    print(labels, len(labels))
+    min = labels.min()
+    max = labels.max()
+    # print('min: ', min, " max: ", max)
+
+    # 打印聚类非0的点云下标，点云数
+    print(np.nonzero(labels), '  type: ', type(np.nonzero(labels)), ' size: ', len(np.array(np.nonzero(labels)[0])))
+
+    zero_index = np.where(labels == 0)  # 提取分类为0的聚类点云下标
+    zero_pcd = pcd.select_by_index(np.array(zero_index)[0])  # 根据下标提取点云点
+    print(zero_pcd)
+    print('zero_index: ', zero_index, " size: ", len(np.array(zero_index)[0]))
+    numface=0
+    face_pcd = o3d.geometry.PointCloud()
+    for label in range(min, max+1):
+        label_index = np.where(labels == label)  # 提取分类为label的聚类点云下标
+        label_pcd = pcd.select_by_index(np.array(label_index)[0])  # 根据下标提取点云点
+        print('label: ', str(label), '点云数：', len(label_pcd.points))
+        if (len(label_pcd.points) > 33000 and len(label_pcd.points) < 34000):
+            # 可视化
+            o3d.visualization.draw_geometries([label_pcd], "o3d dbscanclusting " + str(label) + " results", width=400,height=400)
+            # 分别按分类写入文件
+            face_pcd = face_pcd + label_pcd
+    # o3d.io.write_point_cloud("F:/MRI/data/20221208/" +
+    #                          str(numface+1) + ".ply", face_pcd)
+    o3d.io.write_point_cloud(folder + '/head_piece_mm' + ".ply", face_pcd)
+    o3d.visualization.draw_geometries([face_pcd])
+
+#pcdC =  o3d.io.read_point_cloud('./temp/obj_pcds_' + str(0) + '.pcd')
+#o3d.visualization.draw_geometries([pcdC])
+#DbScanClustering(pcdC,eps=5,min_points=10)
+
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+
+
+temp = o3d.io.read_point_cloud('data/20221208/gray.ply')
+
+if __name__ == "__main__":
+    getPcds('data/20221222')
+# numface=0
+# pcd = o3d.io.read_point_cloud(r"F:\MRI\data\1020\shangji2.ply")
+# DbScanClustering(pcd,numface,eps=5,min_points=1000)
+
